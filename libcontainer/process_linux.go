@@ -40,12 +40,13 @@ type parentProcess interface {
 }
 
 type setnsProcess struct {
-	cmd         *exec.Cmd
-	parentPipe  *os.File
-	childPipe   *os.File
-	cgroupPaths map[string]string
-	config      *initConfig
-	fds         []string
+	cmd           *exec.Cmd
+	parentPipe    *os.File
+	childPipe     *os.File
+	cgroupPaths   map[string]string
+	config        *initConfig
+	fds           []string
+	bootstrapData io.Reader
 }
 
 func (p *setnsProcess) startTime() (string, error) {
@@ -62,6 +63,14 @@ func (p *setnsProcess) signal(sig os.Signal) error {
 
 func (p *setnsProcess) start() (err error) {
 	defer p.parentPipe.Close()
+	err = p.cmd.Start()
+	p.childPipe.Close()
+	if err != nil {
+		return newSystemError(err)
+	}
+	if _, err := io.Copy(p.parentPipe, p.bootstrapData); err != nil {
+		return err
+	}
 	if err = p.execSetns(); err != nil {
 		return newSystemError(err)
 	}
@@ -70,6 +79,7 @@ func (p *setnsProcess) start() (err error) {
 			return newSystemError(err)
 		}
 	}
+
 	if err := json.NewEncoder(p.parentPipe).Encode(p.config); err != nil {
 		return newSystemError(err)
 	}
@@ -94,11 +104,6 @@ func (p *setnsProcess) start() (err error) {
 // before the go runtime boots, we wait on the process to die and receive the child's pid
 // over the provided pipe.
 func (p *setnsProcess) execSetns() error {
-	err := p.cmd.Start()
-	p.childPipe.Close()
-	if err != nil {
-		return newSystemError(err)
-	}
 	status, err := p.cmd.Process.Wait()
 	if err != nil {
 		p.cmd.Wait()
@@ -156,13 +161,14 @@ func (p *setnsProcess) setExternalDescriptors(newFds []string) {
 }
 
 type initProcess struct {
-	cmd        *exec.Cmd
-	parentPipe *os.File
-	childPipe  *os.File
-	config     *initConfig
-	manager    cgroups.Manager
-	container  *linuxContainer
-	fds        []string
+	cmd           *exec.Cmd
+	parentPipe    *os.File
+	childPipe     *os.File
+	config        *initConfig
+	manager       cgroups.Manager
+	container     *linuxContainer
+	fds           []string
+	bootstrapData io.Reader
 }
 
 func (p *initProcess) pid() int {
@@ -173,11 +179,45 @@ func (p *initProcess) externalDescriptors() []string {
 	return p.fds
 }
 
-func (p *initProcess) start() (err error) {
+// execSetns runs the process that executes C code to perform the setns calls
+// because setns support requires the C process to fork off a child and perform the setns
+// before the go runtime boots, we wait on the process to die and receive the child's pid
+// over the provided pipe.
+// This is called by initProcess.start function
+func (p *initProcess) execSetns() error {
+	status, err := p.cmd.Process.Wait()
+	if err != nil {
+		p.cmd.Wait()
+		return err
+	}
+	if !status.Success() {
+		p.cmd.Wait()
+		return &exec.ExitError{ProcessState: status}
+	}
+	var pid *pid
+	if err := json.NewDecoder(p.parentPipe).Decode(&pid); err != nil {
+		p.cmd.Wait()
+		return err
+	}
+	process, err := os.FindProcess(pid.Pid)
+	if err != nil {
+		return err
+	}
+	p.cmd.Process = process
+	return nil
+}
+
+func (p *initProcess) start() error {
 	defer p.parentPipe.Close()
-	err = p.cmd.Start()
+	err := p.cmd.Start()
 	p.childPipe.Close()
 	if err != nil {
+		return newSystemError(err)
+	}
+	if _, err := io.Copy(p.parentPipe, p.bootstrapData); err != nil {
+		return err
+	}
+	if err := p.execSetns(); err != nil {
 		return newSystemError(err)
 	}
 	// Save the standard descriptor names before the container process
@@ -224,6 +264,8 @@ func (p *initProcess) wait() (*os.ProcessState, error) {
 		return p.cmd.ProcessState, err
 	}
 	// we should kill all processes in cgroup when init is died if we use host PID namespace
+	// FIXME: instead of checking here, we should check when create the init
+	// process
 	if p.cmd.SysProcAttr.Cloneflags&syscall.CLONE_NEWPID == 0 {
 		killCgroupProcesses(p.manager)
 	}
