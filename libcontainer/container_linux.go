@@ -174,6 +174,7 @@ func (c *linuxContainer) newInitProcess(p *Process, cmd *exec.Cmd, parentPipe, c
 			nsMaps[ns.Type] = ns.Path
 		}
 	}
+	_, sharePidns := nsMaps[configs.NEWPID]
 	data, err := c.bootstrapData(cmd, c.config.Namespaces.CloneFlags(), nsMaps, "")
 	if err != nil {
 		return nil, err
@@ -185,6 +186,7 @@ func (c *linuxContainer) newInitProcess(p *Process, cmd *exec.Cmd, parentPipe, c
 		manager:       c.cgroupManager,
 		config:        c.newInitConfig(p),
 		bootstrapData: data,
+		sharePidns:    sharePidns,
 	}, nil
 }
 

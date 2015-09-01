@@ -169,6 +169,7 @@ type initProcess struct {
 	container     *linuxContainer
 	fds           []string
 	bootstrapData io.Reader
+	sharePidns    bool
 }
 
 func (p *initProcess) pid() int {
@@ -264,9 +265,7 @@ func (p *initProcess) wait() (*os.ProcessState, error) {
 		return p.cmd.ProcessState, err
 	}
 	// we should kill all processes in cgroup when init is died if we use host PID namespace
-	// FIXME: instead of checking here, we should check when create the init
-	// process
-	if p.cmd.SysProcAttr.Cloneflags&syscall.CLONE_NEWPID == 0 {
+	if p.sharePidns {
 		killCgroupProcesses(p.manager)
 	}
 	return p.cmd.ProcessState, nil
