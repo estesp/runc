@@ -1,11 +1,16 @@
 package nsenter
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -13,29 +18,53 @@ type pid struct {
 	Pid int `json:"Pid"`
 }
 
-func TestNsenterAlivePid(t *testing.T) {
+func TestNsenterValidPaths(t *testing.T) {
 	args := []string{"nsenter-exec"}
-	r, w, err := os.Pipe()
+	parent, child, err := newPipe()
 	if err != nil {
 		t.Fatalf("failed to create pipe %v", err)
 	}
 
+	namespaces := []string{
+		// join pid ns of the current process
+		fmt.Sprintf("/proc/%d/ns/pid", os.Getpid()),
+	}
 	cmd := &exec.Cmd{
 		Path:       os.Args[0],
 		Args:       args,
-		ExtraFiles: []*os.File{w},
-		Env:        []string{fmt.Sprintf("_LIBCONTAINER_INITPID=%d", os.Getpid()), "_LIBCONTAINER_INITPIPE=3"},
+		ExtraFiles: []*os.File{child},
+		Env:        []string{"_LIBCONTAINER_INITPIPE=3"},
+		Stdout:     os.Stdout,
+		Stderr:     os.Stderr,
 	}
 
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("nsenter failed to start %v", err)
 	}
-	w.Close()
+	// write cloneFlags
+	b := bytes.NewBuffer(nil)
+	if err := encodeInt32(b, "clone_flags", uint32(syscall.CLONE_NEWNET)); err != nil {
+		t.Fatal(err)
+	}
+	if err := encodeString(b, "ns_paths", strings.Join(namespaces, ",")); err != nil {
+		t.Fatal(err)
+	}
+	// prefix the total length and then write the data out
+	if err := binary.Write(parent, binary.BigEndian, uint64(b.Len())); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(parent, b); err != nil {
+		t.Fatal(err)
+	}
 
-	decoder := json.NewDecoder(r)
+	decoder := json.NewDecoder(parent)
 	var pid *pid
 
 	if err := decoder.Decode(&pid); err != nil {
+		dir, _ := ioutil.ReadDir(fmt.Sprintf("/proc/%d/ns", os.Getpid()))
+		for _, d := range dir {
+			t.Log(d.Name())
+		}
 		t.Fatalf("%v", err)
 	}
 
@@ -49,37 +78,45 @@ func TestNsenterAlivePid(t *testing.T) {
 	p.Wait()
 }
 
-func TestNsenterInvalidPid(t *testing.T) {
+func TestNsenterInvalidPaths(t *testing.T) {
 	args := []string{"nsenter-exec"}
+	parent, child, err := newPipe()
+	if err != nil {
+		t.Fatalf("failed to create pipe %v", err)
+	}
 
+	namespaces := []string{
+		// join pid ns of the current process
+		fmt.Sprintf("/proc/%d/ns/pid", -1),
+	}
 	cmd := &exec.Cmd{
-		Path: os.Args[0],
-		Args: args,
-		Env:  []string{"_LIBCONTAINER_INITPID=-1"},
+		Path:       os.Args[0],
+		Args:       args,
+		ExtraFiles: []*os.File{child},
+		Env:        []string{"_LIBCONTAINER_INITPIPE=3"},
 	}
 
-	err := cmd.Run()
-	if err == nil {
-		t.Fatal("nsenter exits with a zero exit status")
-	}
-}
-
-func TestNsenterDeadPid(t *testing.T) {
-	dead_cmd := exec.Command("true")
-	if err := dead_cmd.Run(); err != nil {
+	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	args := []string{"nsenter-exec"}
-
-	cmd := &exec.Cmd{
-		Path: os.Args[0],
-		Args: args,
-		Env:  []string{fmt.Sprintf("_LIBCONTAINER_INITPID=%d", dead_cmd.Process.Pid)},
+	// write cloneFlags
+	b := bytes.NewBuffer(nil)
+	if err := encodeInt32(b, "clone_flags", uint32(syscall.CLONE_NEWNET)); err != nil {
+		t.Fatal(err)
+	}
+	if err := encodeString(b, "ns_paths", strings.Join(namespaces, ",")); err != nil {
+		t.Fatal(err)
+	}
+	// prefix the total length and then write the data out
+	if err := binary.Write(parent, binary.BigEndian, uint64(b.Len())); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(parent, b); err != nil {
+		t.Fatal(err)
 	}
 
-	err := cmd.Run()
-	if err == nil {
-		t.Fatal("nsenter exits with a zero exit status")
+	if err := cmd.Wait(); err == nil {
+		t.Fatalf("nsenter exits with a zero exit status")
 	}
 }
 
@@ -88,4 +125,42 @@ func init() {
 		os.Exit(0)
 	}
 	return
+}
+
+func encodeInt32(w io.Writer, name string, val uint32) error {
+	if len(name) > 255 {
+		return fmt.Errorf("%s is too long", name)
+	}
+	if err := binary.Write(w, binary.BigEndian, uint8(len(name))); err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte(name)); err != nil {
+		return err
+	}
+	return binary.Write(w, binary.BigEndian, val)
+}
+
+func encodeString(w io.Writer, name, val string) error {
+	if len(name) > 255 {
+		return fmt.Errorf("%s is too long", name)
+	}
+	if err := binary.Write(w, binary.BigEndian, uint8(len(name))); err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte(name)); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.BigEndian, uint32(len(val))); err != nil {
+		return err
+	}
+	_, err := w.Write([]byte(val))
+	return err
+}
+
+func newPipe() (parent *os.File, child *os.File, err error) {
+	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	return os.NewFile(uintptr(fds[1]), "parent"), os.NewFile(uintptr(fds[0]), "child"), nil
 }
